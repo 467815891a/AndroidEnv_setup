@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 
+curl --fail --silent --location https://git.rip >/dev/null || exit 1
+
 [[ -z ${API_KEY} ]] && echo "API_KEY not defined, exiting!" && exit 1
 
 function sendTG() {
@@ -22,10 +24,10 @@ else
         megadl "'$URL'" || exit 1
     else
         # Try to download certain URLs with axel first
-        if [[ $URL =~ ^.+(ota\.d\.miui\.com|otafsg|oxygenos\.oneplus\.net|dl.google|android.googleapis|ozip)(.+)?$ ]]; then
+        if [[ $URL =~ ^.+(ota\.d\.miui\.com|otafsg|h2os|oxygenos\.oneplus\.net|dl.google|android.googleapis|ozip)(.+)?$ ]]; then
             axel -q -a -n64 "$URL" || {
                 # Try to download with aria, else wget. Clean the directory each time.
-                aria2c -j64 "${URL}" || {
+                aria2c -q -s16 -x16 "${URL}" || {
                     rm -fv ./*
                     wget "${URL}" || {
                         echo "Download failed. Exiting."
@@ -36,7 +38,7 @@ else
             }
         else
             # Try to download with aria, else wget. Clean the directory each time.
-            aria2c -j64 "${URL}" || {
+            aria2c -q -s16 -x16 "${URL}" || {
                 rm -fv ./*
                 wget "${URL}" || {
                     echo "Download failed. Exiting."
@@ -83,6 +85,12 @@ else
     git -C ~/mkbootimg_tools pull
 fi
 
+if [[ ! -d "${HOME}/vmlinux-to-elf" ]]; then
+    git clone -q https://github.com/marin-m/vmlinux-to-elf ~/vmlinux-to-elf
+else
+    git -C ~/vmlinux-to-elf pull
+fi
+
 bash ~/Firmware_extractor/extractor.sh "${FILE}" "${PWD}" || (
     sendTG "Extraction failed!"
     exit 1
@@ -95,12 +103,12 @@ for p in $PARTITIONS; do
     if [ -f "$p.img" ]; then
         mkdir "$p" || rm -rf "${p:?}"/*
         7z x "$p".img -y -o"$p"/ || {
-        sudo mount -o loop "$p".img "$p"
-        mkdir "${p}_"
-        sudo cp -rf "${p}/*" "${p}_"
-        sudo umount "${p}"
-        sudo mv "${p}_" "${p}"
-}
+            sudo mount -o loop "$p".img "$p"
+            mkdir "${p}_"
+            sudo cp -rf "${p}/*" "${p}_"
+            sudo umount "${p}"
+            sudo mv "${p}_" "${p}"
+        }
         rm -fv "$p".img
     fi
 done
@@ -111,16 +119,41 @@ ls system/build*.prop 2> /dev/null || ls system/system/build*.prop 2> /dev/null 
     exit 1
 }
 
+if [[ ! -f "boot.img" ]]; then
+    x=$(find . -type f -name "boot.img")
+    if [[ -n "$x" ]]; then
+        mv -v "$x" boot.img
+    else
+        echo "boot.img not found!"
+    fi
+fi
+
+if [[ ! -f "dtbo.img" ]]; then
+    x=$(find . -type f -name "dtbo.img")
+    if [[ -n "$x" ]]; then
+        mv -v "$x" dtbo.img
+    else
+        echo "dtbo.img not found!"
+    fi
+fi
+
 # Extract bootimage and dtbo
 if [[ -f "boot.img" ]]; then
     mkdir -v bootdts
     ~/mkbootimg_tools/mkboot ./boot.img ./bootimg > /dev/null
     python3 ~/extract-dtb/extract-dtb.py ./boot.img -o ./bootimg > /dev/null
     find bootimg/ -name '*.dtb' -type f -exec dtc -I dtb -O dts {} -o bootdts/"$(echo {} | sed 's/\.dtb/.dts/')" \; > /dev/null 2>&1
-    rm -fv boot.img
+    # Extract ikconfig
+    if [[ "$(command -v extract-ikconfig)" ]]; then
+        extract-ikconfig boot.img > ikconfig
+    fi
+    # Kallsyms
+    python3 ~/vmlinux-to-elf/vmlinux_to_elf/kallsyms_finder.py boot.img > kallsyms.txt
+    # ELF
+    python3 ~/vmlinux-to-elf/vmlinux_to_elf/main.py boot.img boot.elf
 fi
 if [[ -f "dtbo.img" ]]; then
-    mkdir -v dtbodts 
+    mkdir -v dtbodts
     python3 ~/extract-dtb/extract-dtb.py ./dtbo.img -o ./dtbo > /dev/null
     find dtbo/ -name '*.dtb' -type f -exec dtc -I dtb -O dts {} -o dtbodts/"$(echo {} | sed 's/\.dtb/.dts/')" \; > /dev/null 2>&1
 fi
@@ -129,7 +162,7 @@ fi
 if [[ -d "vendor/euclid" ]]; then
     pushd vendor/euclid || exit 1
     for f in *.img; do
-        [[ -f "$f" ]] || continue
+        [[ -f $f ]] || continue
         7z x "$f" -o"${f/.img/}"
         rm -fv "$f"
     done
@@ -221,7 +254,7 @@ description=$(grep -oP "(?<=^ro.build.description=).*" -hs {system,system/system
 [[ -z ${description} ]] && description="$flavor $release $id $incremental $tags"
 branch=$(echo "$description" | tr ' ' '-')
 repo_subgroup=$(echo "$brand" | tr '[:upper:]' '[:lower:]')
-[[ -z "$repo_subgroup" ]] && repo_subgroup=$(echo "$manufacturer" | tr '[:upper:]' '[:lower:]')
+[[ -z $repo_subgroup ]] && repo_subgroup=$(echo "$manufacturer" | tr '[:upper:]' '[:lower:]')
 repo_name=$(echo "$codename" | tr '[:upper:]' '[:lower:]')
 repo="$repo_subgroup/$repo_name"
 platform=$(echo "$platform" | tr '[:upper:]' '[:lower:]' | tr -dc '[:print:]' | tr '_' '-' | cut -c 1-35)
@@ -240,20 +273,21 @@ fi
 group_id="$(jq -r '.id' x)"
 rm -f x
 
-[[ -z "$group_id" ]] && {
+[[ -z $group_id ]] && {
     sendTG "Unable to get gitlab group id!"
     exit 1
 }
 
 # Create the repo if it doesn't exist
 curl --silent -H "Authorization: bearer ${DUMPER_TOKEN}" "https://git.rip/api/v4/projects/$ORG%2f$repo_subgroup%2f$repo_name" > x
+message="$(jq -r .message x)"
 project_id="$(jq .id x)"
 rm -f x
-if [[ -z "$project_id" ]]; then
-    curl --silent -H "Authorization: bearer ${DUMPER_TOKEN}" "https://git.rip/api/v4/projects" -X POST -F namespace_id="$group_id" -F name="$repo" > x
+if [[ $message == "404 Project Not Found" ]]; then
+    curl --silent -H "Authorization: bearer ${DUMPER_TOKEN}" "https://git.rip/api/v4/projects" -X POST -F namespace_id="$group_id" -F name="$repo_name" -F visibility=public > x
     project_id="$(jq .id x)"
     rm -f x
-    if [[ -z "$project_id" ]]; then
+    if [[ -z $project_id ]]; then
         sendTG "Could not get project id"
         exit 1
     fi
@@ -261,7 +295,7 @@ fi
 
 curl --silent -H "Authorization: bearer ${DUMPER_TOKEN}" "https://git.rip/api/v4/projects/$project_id/repository/branches/$branch" > x
 [[ "$(jq -r '.name' x)" == "$branch" ]] && {
-    sendTG "$branch already exists in [$repo](https://git.rip/dumps/$repo)!"
+    sendTG "$branch already exists in <a href=\"https://git.rip/dumps/$repo\">$repo</a>!"
     rm -f x
     exit 1
 }
@@ -277,13 +311,13 @@ sendTG "Committing and pushing"
 git add -A
 git commit --quiet --signoff --message="$description"
 git push "https://dumper:$DUMPER_TOKEN@git.rip/$ORG/$repo.git" HEAD:refs/heads/"$branch" || {
-    sendTG "Pushing failed (Already dumped?)"
+    sendTG "Pushing failed!"
     echo "Pushing failed!"
     exit 1
 }
-   
+
 # Set default branch to the newly pushed branch
-curl -s -H "Authorization: bearer ${DUMPER_TOKEN}" "https://git.rip/api/v4/projects/$project_id" -X PUT -F default_branch="$branch" -F visibility=public > /dev/null
+curl -s -H "Authorization: bearer ${DUMPER_TOKEN}" "https://git.rip/api/v4/projects/$project_id" -X PUT -F default_branch="$branch" > /dev/null
 
 # Send message to Telegram group
 sendTG "Pushed <a href=\"https://git.rip/$ORG/$repo\">$description</a>"
